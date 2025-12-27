@@ -6,7 +6,7 @@
     "created": "2025-11-17T00:00:00",
     "referral_code": "MARCO2025",
     "referred_by": null,
-    "tokens": 100,
+    "tokens": 90,
     "salt": "1064c6cef9224dde835590a1dadd3a09",
     "password_hash": "8bd630d1d468a6d86d130855feac4ea7eaa69dc04077264d18d255bf019d9f28"
   },
@@ -17,7 +17,7 @@
     "created": "2025-11-17T00:00:00",
     "referral_code": "TEST1234",
     "referred_by": null,
-    "tokens": 100,
+    "tokens": 80,
     "salt": "abc123",
     "password_hash": "placeholder"
   },
@@ -42,5 +42,27 @@
     "tokens": 130,
     "salt": "30cfe03f58b543c0b12ab4a5d9b9c529",
     "password_hash": "3d78865ea8a2972930218dc5ec8ef9c65a83cbd1e78333ab5cb85bf78ff5bbdd"
+  },
+  {
+    "id": "user-ram-001",
+    "username": "ram",
+    "display_name": "Ram",
+    "created": "2025-12-27T00:00:00",
+    "referral_code": "RAM2025",
+    "referred_by": null,
+    "tokens": 200,
+    "salt": "ramsalt123",
+    "password_hash": "placeholder"
+  },
+  {
+    "id": "user-jiko-001",
+    "username": "jiko",
+    "display_name": "Jiko",
+    "created": "2025-12-27T00:00:00",
+    "referral_code": "JIKO2025",
+    "referred_by": null,
+    "tokens": 190,
+    "salt": "jikosalt123",
+    "password_hash": "placeholder"
   }
 ]

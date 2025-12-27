@@ -1,10 +1,8 @@
 # ...existing code...
-from fastapi import FastAPI, Query, Request, Form
+from fastapi import FastAPI, Query, Request, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-from fastapi import UploadFile, File, Form 
-from fastapi import UploadFile, File
 import joblib
 import pandas as pd
 import numpy as np
@@ -15,9 +13,15 @@ import uuid
 import hashlib
 import csv
 import requests
+import warnings
 from datetime import datetime
 from fastapi import HTTPException
 import pvp_utils
+from sklearn.exceptions import InconsistentVersionWarning
+from unified_db import (
+    init_db, get_db, User, create_user, get_user_by_username,
+    authenticate_user, deduct_tokens, add_tokens, hash_password, verify_password
+)
 
 # Team name mapping for user-friendly input
 TEAM_NAME_MAP = {
@@ -205,6 +209,9 @@ class WicketPredictionRequest(BaseModel):
 
 app = FastAPI(title="IPL Predictor API 2025", version="2.0")
 
+# Initialize unified database
+init_db()
+
 # Enable CORS for frontend-backend communication
 app.add_middleware(
     CORSMiddleware,
@@ -215,16 +222,24 @@ app.add_middleware(
 )
 
 # Load model and encoders (if they exist)
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=InconsistentVersionWarning)
+
 try:
     MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
     if os.path.exists(MODEL_PATH):
-        model_bundle = joblib.load(MODEL_PATH)
-        model = model_bundle["model"]
-        team_encoder = model_bundle["team_encoder"]
-        winner_encoder = model_bundle["winner_encoder"]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model_bundle = joblib.load(MODEL_PATH)
+            model = model_bundle["model"]
+            team_encoder = model_bundle["team_encoder"]
+            winner_encoder = model_bundle["winner_encoder"]
+        print("✓ Model loaded successfully (version warnings suppressed)")
     else:
         model = None
-except:
+        print("⚠ Model file not found - using fallback predictions")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
     model = None
 
 def normalize_team_name(name):
@@ -386,23 +401,10 @@ def get_venues():
 
 # ==================== PREDICTION ENDPOINTS ====================
 @app.post("/predict/match")
-def predict_match_endpoint(request: PredictionRequest):
+def predict_match_endpoint(request: PredictionRequest, db = Depends(get_db)):
     """Predict match winner with detailed analysis"""
     try:
-        # charge tokens if username provided
-        username = request.username
-        if not username:
-            return {"ok": False, "error": "username is required to make a prediction (tokens will be used)"}
-        users = read_json(USERS_FILE)
-        user = next((u for u in users if u.get('username') == username), None)
-        if not user:
-            return {"ok": False, "error": "user not found"}
-        if int(user.get('tokens', 0)) < 10:
-            return {"ok": False, "error": "insufficient tokens"}
-        # deduct tokens and save
-        user['tokens'] = int(user.get('tokens', 0)) - 10
-        write_json(USERS_FILE, users)
-
+        # Make prediction (works for both authenticated and demo users)
         prediction = predict_match(
             request.team1,
             request.team2,
@@ -413,10 +415,30 @@ def predict_match_endpoint(request: PredictionRequest):
             request.wicketsTeam1,
             request.wicketsTeam2
         )
-        prediction['charged_user'] = username
-        prediction['tokens_remaining'] = user['tokens']
+        
+        # If username provided, deduct tokens from database
+        username = request.username
+        if username:
+            user = get_user_by_username(db, username)
+            if not user:
+                # User doesn't exist yet - allow prediction but don't charge
+                prediction['note'] = "Demo prediction (user account not found)"
+                return prediction
+            
+            if user.tokens < 10:
+                return {"ok": False, "error": "insufficient tokens"}
+            
+            # Deduct tokens
+            deduct_tokens(db, username, 10)
+            prediction['charged_user'] = username
+            prediction['tokens_remaining'] = user.tokens - 10
+        else:
+            # No username - demo mode
+            prediction['note'] = "Demo prediction (not charged)"
+        
         return prediction
     except Exception as e:
+        print(f"Prediction error: {e}")
         return {"error": str(e)}
 
 @app.post("/predict/wickets")
@@ -783,111 +805,67 @@ def _generate_referral_code(existing_codes: set):
 
 
 @app.post("/users/register")
-def register_user(username: Optional[str] = Form(None), display_name: Optional[str] = Form(None), referral_code: Optional[str] = Form(None), password: Optional[str] = Form(None)):
-    """Register a new user using persistent Auth Database API.
-
-    User data is stored permanently in SQLite database via auth_db service.
-    """
-    import requests
+def register_user(data: dict, db = Depends(get_db)):
+    """Register a new user using unified database"""
+    
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    display_name = data.get("display_name", username)
     
     if not username:
         return {"ok": False, "error": "username is required"}
-
     if not password:
         return {"ok": False, "error": "password is required"}
-
+    
     try:
-        # Register via Auth Database API (port 8002) for persistent storage
-        auth_response = requests.post(
-            "http://127.0.0.1:8002/auth/register",
-            json={
-                "username": username,
-                "email": f"{username}@cricket.local",
-                "password": password,
-                "referral_code": referral_code
-            },
-            timeout=10
+        user = create_user(
+            db,
+            username=username,
+            display_name=display_name,
+            password=password,
+            email=f"{username}@cricket.local"
         )
         
-        if auth_response.status_code == 200:
-            data = auth_response.json()
-            user_data = data.get('user', {})
-            return {
-                "ok": True,
-                "user": {
-                    "id": str(user_data.get('id', uuid.uuid4())),
-                    "username": user_data.get('username'),
-                    "display_name": display_name or username,
-                    "tokens": user_data.get('tokens', 100),
-                    "created": datetime.utcnow().isoformat(),
-                    "referral_code": user_data.get('referral_code'),
-                    "referred_by": None
-                },
-                "token": data.get('access_token', str(uuid.uuid4()))
-            }
+        return {
+            "ok": True,
+            "user": user.to_dict(),
+            "token": str(uuid.uuid4())
+        }
+    except ValueError as e:
+        if "already exists" in str(e):
+            return {"ok": False, "error": "username exists"}
         else:
-            error_data = auth_response.json()
-            return {"ok": False, "error": error_data.get('detail', 'Registration failed')}
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "error": "Auth service unavailable - is port 8002 running?"}
-    except requests.exceptions.Timeout:
-        return {"ok": False, "error": "Auth service timeout - please try again"}
+            return {"ok": False, "error": str(e)}
     except Exception as e:
-        print(f"Auth API error: {e}")
-        return {"ok": False, "error": "Registration service unavailable"}
+        print(f"Registration error: {e}")
+        return {"ok": False, "error": "Registration failed"}
 
 
 @app.post("/users/login")
-def login_user(username_or_email: Optional[str] = Form(None), password: Optional[str] = Form(None)):
-    """Authenticate a user using persistent Auth Database API.
+def login_user(data: dict, db = Depends(get_db)):
+    """Authenticate a user using unified database"""
     
-    User credentials are verified against SQLite database via auth_db service.
-    Returns user info and token on success - data persists permanently!
-    """
-    import requests
+    username_or_email = data.get("username", "").strip() or data.get("email", "").strip()
+    password = data.get("password", "").strip()
     
     if not username_or_email or not password:
-        return {"ok": False, "error": "username_or_email and password are required"}
+        return {"ok": False, "error": "username and password are required"}
 
     try:
-        # Login via Auth Database API (port 8002) for persistent authentication
-        auth_response = requests.post(
-            "http://127.0.0.1:8002/auth/login",
-            json={
-                "username": username_or_email,
-                "password": password
-            },
-            timeout=10
-        )
+        # Authenticate user
+        user = authenticate_user(db, username_or_email, password)
         
-        if auth_response.status_code == 200:
-            data = auth_response.json()
-            user_data = data.get('user', {})
-            token = data.get('access_token', str(uuid.uuid4()))
-            
+        if user:
             return {
                 "ok": True,
-                "user": {
-                    "id": str(user_data.get('id', uuid.uuid4())),
-                    "username": user_data.get('username'),
-                    "display_name": user_data.get('username'),
-                    "tokens": user_data.get('tokens', 100),
-                    "created": user_data.get('created_at', datetime.utcnow().isoformat()),
-                    "referral_code": user_data.get('referral_code'),
-                    "referred_by": None
-                },
-                "token": token
+                "user": user.to_dict(),
+                "token": str(uuid.uuid4())
             }
         else:
-            error_data = auth_response.json()
-            return {"ok": False, "error": error_data.get('detail', 'Login failed')}
+            return {"ok": False, "error": "Invalid username or password"}
             
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "error": "Auth service unavailable - is port 8002 running?"}
-    except requests.exceptions.Timeout:
-        return {"ok": False, "error": "Auth service timeout - please try again"}
     except Exception as e:
-        print(f"Auth API error: {e}")
+        print(f"Login error: {e}")
         return {"ok": False, "error": "Login failed"}
 
 @app.post("/fantasy/recommend")
